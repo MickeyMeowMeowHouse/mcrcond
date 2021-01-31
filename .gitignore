@@ -1,0 +1,4 @@
+*.o
+*.conf
+*.log
+mcrcond
