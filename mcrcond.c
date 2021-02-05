@@ -61,6 +61,8 @@
 #define CLIENT_BUFFER_SIZE 4096
 #define SOCKET_BUFFER_SIZE 8192
 
+#define MAX_SERVER_WAIT_INTERVAL (5 * 60)
+
 static int signal_exit_catch = 0;
 static void signal_handler(int sig)
 {
@@ -709,6 +711,7 @@ int di_run(daemon_inst_p di)
 	rcon_packet_p packrecv = (rcon_packet_p)response_buf;
 	size_t cb_to_recv = 0;
 	size_t cb_recv = 0;
+	int wait_interval = 0;
 
 	di->cur_request_id = (int)time(NULL);
 
@@ -718,7 +721,16 @@ int di_run(daemon_inst_p di)
 		{
 			if(di->daemonized && !signal_exit_catch)
 			{
-				sleep(1);
+				int wait_value;
+				if (wait_interval < 1)
+					wait_interval = 1;
+				else if (wait_interval < MAX_SERVER_WAIT_INTERVAL)
+					wait_interval <<= 1;
+				else
+					wait_interval = MAX_SERVER_WAIT_INTERVAL;
+				wait_value = rand() % wait_interval;
+				if (wait_value < 1) wait_value = 1;
+				sleep(wait_value);
 				continue;
 			}
 			else
@@ -728,6 +740,7 @@ int di_run(daemon_inst_p di)
 		}
 		if(!di_rcon_auth(di)) return 0;
 		if(!di_init_listener_socket(di)) return 0;
+		wait_interval = 1;
 
 		while(!signal_exit_catch)
 		{
