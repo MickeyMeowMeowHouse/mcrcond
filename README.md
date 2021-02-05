@@ -26,6 +26,8 @@ If the command needs parameters, you have to use the quotation marks:
 
 There's no standard way for you to install this software. You need to setup your own script for the daemon to run, and edit the configuration file for your server.
 
+To compile this program, simply run `make`. The source code is a single `.c` file, use `gcc` or `clang` is able to compile it to get the executable.
+
 ## Notice
 
 Currently, run it as a screen session is recommended because the real daemon mode implementation **isn't stable** . If you can fix this or you think it's needed to run as a real daemon, please modify the code yourself, then send me a pull request.
