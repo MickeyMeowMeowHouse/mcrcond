@@ -716,7 +716,7 @@ int di_run(daemon_inst_p di)
 	{
 		if(!di_init_rcon_socket(di))
 		{
-			if(di->daemonized)
+			if(di->daemonized && !signal_exit_catch)
 			{
 				sleep(1);
 				continue;
@@ -1055,7 +1055,7 @@ int di_run(daemon_inst_p di)
 		}
 
 OnRconReset:;
-	}while(di->daemonized);
+	}while(di->daemonized && !signal_exit_catch);
 
 	return 1;
 }
