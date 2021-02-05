@@ -6,7 +6,11 @@ The daemon is to help for scripting the Minecraft server. It's written by C, to 
 
 First, you need to enable RCON for your Minecraft server by editing `server.properites` to enable the RCON port of the server. Then you can run the program as a daemon, it connects the Minecraft server's RCON port, and then it's ready for you to run commands through it's client mode.
 
-Typically use a screen for the container to run it as the daemon. For example:
+Typically run the daemon by a single command line:
+
+    # ./mcrcond -s
+
+Or you can also use a screen for the container to run it as the daemon. For example:
 
     # screen -S MCRCOND ./mcrcond -s
     
@@ -30,9 +34,7 @@ To compile this program, simply run `make`. The source code is a single `.c` fil
 
 ## Notice
 
-Currently, run it as a screen session is recommended because the real daemon mode implementation **isn't stable** . If you can fix this or you think it's needed to run as a real daemon, please modify the code yourself, then send me a pull request.
-
-If the Minecraft server closes the RCON connection, the daemon mode program exits. **You have to design a loop script** to keep the daemon running. There's mainly 2 reasons that the server will close the connection:
+If the daemon is running as a screen session, and the Minecraft server closes the RCON connection, the program exits. **You have to design a loop script** to keep the daemon running when using `-s` option to run. There's mainly 2 reasons that the server will close the connection:
 
 * The RCON client sent a command that's too long (above 14xx bytes)
 * The Minecraft server stops
@@ -45,5 +47,9 @@ The loop script can be designed like this:
      ./mcrcond -s
      sleep 1s
     done
+
+And the script file (assume the name is `mcrcond_loop.sh`) should be run as:
+
+    screen -S MCRCOND ./mcrcond_loop.sh
 
 Pay attention to the log file. You can modify the configuration file to select which information you want to log. And the log file would not be automatically separated, so as time goes by, it will grows very very big. You need to remove the old log file to make sure your disk space isn't wasted, but still, the log file may contains very important history informations, please use the log file properly.
