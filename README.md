@@ -10,6 +10,10 @@ Typically run the daemon by a single command line:
 
     # ./mcrcond -s
 
+If you want to stop the daemon, use `kill` or `killall` to stop it:
+
+    # killall mcrcond
+
 Or you can also use a screen for the container to run it as the daemon. For example:
 
     # screen -S MCRCOND ./mcrcond -s
