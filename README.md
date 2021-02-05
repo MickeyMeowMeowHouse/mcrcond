@@ -8,7 +8,7 @@ First, you need to enable RCON for your Minecraft server by editing `server.prop
 
 Typically run the daemon by a single command line:
 
-    # ./mcrcond -s
+    # ./mcrcond -d
 
 If you want to stop the daemon, use `kill` or `killall` to stop it:
 
