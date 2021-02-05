@@ -186,6 +186,7 @@ void di_delete(daemon_inst_p di)
 				close(di->clients[i].socket_client);
 			}
 		}
+		free(di->clients);
 	}
 	if(di->fp_log)
 	{
@@ -439,6 +440,29 @@ static int is_v4_addr(struct sockaddr *addr, socklen_t addr_len)
 	return (addr->sa_family == AF_INET && addr_len == sizeof(struct sockaddr_in));
 }
 
+static void di_reset_listener_socket(daemon_inst_p di)
+{
+	if(di->socket_listen != -1)
+	{
+		close(di->socket_listen);
+		di->socket_listen = -1;
+	}
+	di->client_count = 0;
+	if(di->clients)
+	{
+		size_t i;
+		for (i = 0; i < di->client_count; i++)
+		{
+			if(di->clients[i].socket_client != -1)
+			{
+				close(di->clients[i].socket_client);
+			}
+		}
+		free(di->clients);
+		di->clients = NULL;
+	}
+}
+
 // Create the socket for listening from the clients
 static int di_init_listener_socket(daemon_inst_p di)
 {
@@ -447,6 +471,8 @@ static int di_init_listener_socket(daemon_inst_p di)
 	int s, sfd = -1;
 	char port_buf[8];
 	size_t i;
+
+	di_reset_listener_socket(di);
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
@@ -528,11 +554,7 @@ static int di_init_listener_socket(daemon_inst_p di)
 
 	return 1;
 FailExit:
-	if(di->socket_listen != -1)
-	{
-		close(di->socket_listen);
-		di->socket_listen = -1;
-	}
+	di_reset_listener_socket(di);
 	if(result) freeaddrinfo(result);
 	return 0;
 }
@@ -544,6 +566,12 @@ static int di_init_rcon_socket(daemon_inst_p di)
 	struct addrinfo *result = NULL, *rp;
 	int s, sfd = -1;
 	char port_buf[8];
+
+	if(di->socket_to_rcon != -1)
+	{
+		close(di->socket_to_rcon);
+		di->socket_to_rcon = -1;
+	}
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC; // IPv4 or IPv6
@@ -603,6 +631,30 @@ static int di_send_rcon_packet(daemon_inst_p di, int request_id, int type, void 
 	return send(di->socket_to_rcon, send_buf, send_len, 0);
 }
 
+static int di_new_request_id(daemon_inst_p di)
+{
+	size_t i;
+	di->cur_request_id ++;
+	for(;;)
+	{
+		int req_id_inuse = 0;
+
+		for(i = 0; i < di->client_count; i++)
+		{
+			daemon_client_p c = &di->clients[i];
+			if (c->socket_client == -1) continue;
+			if (c->request_id == di->cur_request_id)
+			{
+				di->cur_request_id ++;
+				req_id_inuse = 1;
+				break;
+			}
+		}
+
+		if (!req_id_inuse) return di->cur_request_id;
+	}
+}
+
 // Start authentication to the RCON server
 static int di_rcon_auth(daemon_inst_p di)
 {
@@ -610,7 +662,7 @@ static int di_rcon_auth(daemon_inst_p di)
 	int nrecv;
 	rcon_packet_p packrecv = (rcon_packet_p)&recv_buf;
 	size_t send_len;
-	int req_id = di->cur_request_id++;
+	int req_id = di_new_request_id(di);
 
 	if(di_send_rcon_packet(di, req_id, 3, di->conf_rcon_auth, strlen(di->conf_rcon_auth), &send_len) != send_len)
 	{
@@ -644,18 +696,6 @@ FailExit:
 	return 0;
 }
 
-// Initialize the daemon after the configures were loaded
-int di_init(daemon_inst_p di)
-{
-	di->cur_request_id = (int)time(NULL);
-
-	if(!di_init_rcon_socket(di)) return 0;
-	if(!di_rcon_auth(di)) return 0;
-	if(!di_init_listener_socket(di)) return 0;
-
-	return 1;
-}
-
 // Run the daemon
 int di_run(daemon_inst_p di)
 {
@@ -670,264 +710,294 @@ int di_run(daemon_inst_p di)
 	size_t cb_to_recv = 0;
 	size_t cb_recv = 0;
 
-	while(!signal_exit_catch)
+	di->cur_request_id = (int)time(NULL);
+
+	do // while (di->daemonized)
 	{
-		int maxfd = 0;
-		int rcon_ready_to_send = 0;
-		FD_ZERO(&readfds);
-		FD_ZERO(&writefds);
-		timeout.tv_sec = 1;
-		timeout.tv_usec = 0;
-
-		// Add active client sockets to the select() file descriptors list
-		for(i = 0; i < di->client_count; i ++)
+		if(!di_init_rcon_socket(di))
 		{
-			int sock = di->clients[i].socket_client;
-			if(sock != -1)
+			if(di->daemonized)
 			{
-				FD_SET(sock, &readfds);
-				FD_SET(sock, &writefds);
-				maxfd ++;
-			}
-		}
-
-		// Add the RCON server to the list
-		FD_SET(di->socket_to_rcon, &readfds);
-		FD_SET(di->socket_to_rcon, &writefds);
-		maxfd ++;
-
-		// Add the listener server to the list
-		if(maxfd < di->client_count)
-		{
-			FD_SET(di->socket_listen, &readfds);
-			maxfd ++;
-		}
-
-		// First, wait for any activity of the sockets.
-		retval = select(FD_SETSIZE, &readfds, &writefds, NULL, &timeout);
-		if(retval == -1)
-		{
-			di_printf(di, "[FAIL] select() failed: %s.\n", strerror(errno));
-			return 0;
-		}
-
-		// Receive responses from the RCON server
-		if (!cb_to_recv || cb_recv < cb_to_recv)
-		{
-			if (FD_ISSET(di->socket_to_rcon, &readfds))
-			{
-				retval = recv(di->socket_to_rcon, recv_buf, sizeof recv_buf, 0);
-				if (retval <= 0)
-				{
-					if (retval < 0)
-					{
-						di_printf(di, "[FAIL] Receive responses from the RCON server failed: %s.\n", strerror(errno));
-					}
-					else
-					{
-						// If too many of the requests had sent in a very short time, the server closes the connection.
-						di_printf(di, "[INFO] The RCON server closed the connection.\n");
-					}
-					return 1;
-				}
-				if (retval + cb_recv > sizeof response_buf)
-				{
-					// This would hardly happen since 'response_buf' is twice big as 'recv_buf' and 'recv_buf' is 8kb and it's twice big as the maximum response payload size
-					di_printf(di, "[FAIL] The RCON server returned a packet with wrong size (%d) which was too big to fit the buffer.\n", (int)(retval + cb_recv));
-					return 0;
-				}
-				memcpy(&response_buf[cb_recv], recv_buf, retval);
-				cb_recv += retval;
-
-				if (!cb_to_recv && cb_recv >= 4) cb_to_recv = packrecv->length + 4;
-				if (di->conf_debug) di_printf(di, "[DEBUG] RCON response received: packet size = %zu, received size = %zu\n", cb_to_recv, cb_recv);
-			}
-		}
-
-		// If a complete response had received, redirect it to the specific client
-		if(cb_to_recv && cb_recv >= cb_to_recv)
-		{
-			size_t cb_payload = cb_to_recv - RCON_HEADER_SIZE;
-			if (packrecv->type != 0)
-			{
-				di_printf(di, "[FAIL] The RCON server returned a packet with unknown type (%d).\n", packrecv->type);
-				return 0;
-			}
-
-			// Redirect the packet to the client which have the same request id
-			for(i = 0; i < di->client_count; i++)
-			{
-				daemon_client_p c = &di->clients[i];
-
-				// Check if activity or not
-				if (c->socket_client == -1) continue;
-
-				// Check the request id
-				if (c->request_id != packrecv->request_id) continue;
-
-				// Check if it had redirected the response it already got
-				if (c->response_received && !c->response_sent) break;
-
-				memcpy(c->response, packrecv->payload, cb_payload);
-				c->response_received = 1;
-				c->response_sent = 0;
-				c->response_size = cb_payload;
-				if (di->conf_debug) di_printf(di, "[DEBUG] RCON response copied to %zu: %s\n", i, c->response);
-				break;
-			}
-
-			// Check if no client matches
-			if (i >= di->client_count)
-			{
-				if (di->conf_log_rcon) di_printf(di, "[RCON] (Not redirected to client) %s\n", packrecv->payload);
-				di_printf(di, "[INFO] The RCON server returned a packet with a request id (%d) which doesn't belongs to current clients.\n", packrecv->request_id);
-			}
-			cb_recv -= cb_to_recv;
-			if (cb_recv)
-			{
-				memmove(response_buf, &response_buf[cb_to_recv], cb_recv);
-				if (cb_recv >= 4)
-				{
-					cb_to_recv = packrecv->length + 4;
-					if (di->conf_debug) di_printf(di, "[DEBUG] Remaining %zu bytes of response with packet size %zu to redirect.\n", cb_recv, cb_to_recv);
-				}
-				else
-				{
-					cb_to_recv = 0;
-					if (di->conf_debug) di_printf(di, "[DEBUG] Remaining %zu bytes of response to redirect.\n", cb_recv);
-				}
+				sleep(1);
+				continue;
 			}
 			else
 			{
-				cb_to_recv = 0;
+				return 0;
 			}
 		}
-		
-		if (FD_ISSET(di->socket_to_rcon, &writefds))
-		{
-			rcon_ready_to_send = 1;
-		}
+		if(!di_rcon_auth(di)) return 0;
+		if(!di_init_listener_socket(di)) return 0;
 
-		for(i = 0; i < di->client_count; i++)
+		while(!signal_exit_catch)
 		{
-			daemon_client_p c = &di->clients[i];
-			int sock = c->socket_client;
-			if (sock == -1) continue;
-			if (!c->buffer_to_receive || c->buffer_received < c->buffer_to_receive)
+			int maxfd = 0;
+			int rcon_ready_to_send = 0;
+			FD_ZERO(&readfds);
+			FD_ZERO(&writefds);
+			timeout.tv_sec = 1;
+			timeout.tv_usec = 0;
+
+			// Add active client sockets to the select() file descriptors list
+			for(i = 0; i < di->client_count; i ++)
 			{
-				if (FD_ISSET(sock, &readfds))
+				int sock = di->clients[i].socket_client;
+				if(sock != -1)
 				{
-					retval = recv(sock, recv_buf, sizeof recv_buf, 0);
-					// Check if error occurs or the client closes the socket
+					FD_SET(sock, &readfds);
+					FD_SET(sock, &writefds);
+					maxfd ++;
+				}
+			}
+
+			// Add the RCON server to the list
+			FD_SET(di->socket_to_rcon, &readfds);
+			FD_SET(di->socket_to_rcon, &writefds);
+			maxfd ++;
+
+			// Add the listener server to the list
+			if(maxfd < di->client_count)
+			{
+				FD_SET(di->socket_listen, &readfds);
+				maxfd ++;
+			}
+
+			// First, wait for any activity of the sockets.
+			retval = select(FD_SETSIZE, &readfds, &writefds, NULL, &timeout);
+			if(retval == -1)
+			{
+				di_printf(di, "[FAIL] select() failed: %s.\n", strerror(errno));
+				return 0;
+			}
+
+			// Receive responses from the RCON server
+			if (!cb_to_recv || cb_recv < cb_to_recv)
+			{
+				if (FD_ISSET(di->socket_to_rcon, &readfds))
+				{
+					retval = recv(di->socket_to_rcon, recv_buf, sizeof recv_buf, 0);
 					if (retval <= 0)
 					{
 						if (retval < 0)
 						{
-							di_printf(di, "[WARN] Receive requests from client %zu failed: %s.\n", i, strerror(errno));
+							di_printf(di, "[FAIL] Receive responses from the RCON server failed: %s.\n", strerror(errno));
 						}
 						else
 						{
-							if (di->conf_debug) di_printf(di, "[DEBUG] The client %zu closed the connection.\n", i);
+							// If too many of the requests had sent in a very short time, the server closes the connection.
+							di_printf(di, "[INFO] The RCON server closed the connection.\n");
 						}
-						c->socket_client = -1;
-						close(sock);
-						continue;
+						goto OnRconReset;
 					}
-
-					// Copy the received data to the end of the buffer
-					if (c->buffer_received + retval <= sizeof c->buffer)
+					if (retval + cb_recv > sizeof response_buf)
 					{
-						memcpy(&c->buffer[c->buffer_received], recv_buf, retval);
-						c->buffer_received += retval;
+						// This would hardly happen since 'response_buf' is twice big as 'recv_buf' and 'recv_buf' is 8kb and it's twice big as the maximum response payload size
+						di_printf(di, "[FAIL] The RCON server returned a packet with wrong size (%d) which was too big to fit the buffer.\n", (int)(retval + cb_recv));
+						goto OnRconReset;
 					}
-					else
-					{
-						di_printf(di, "[WARN] The client %zu had sent too many data (%zu bytes) that could not fit the buffer (capacity of %zu bytes).\n",
-							i, c->buffer_received + retval, sizeof c->buffer);
-						c->socket_client = -1;
-						close(sock);
-						continue;
-					}
+					memcpy(&response_buf[cb_recv], recv_buf, retval);
+					cb_recv += retval;
 
-					// The first 4 bytes is the length of client's packet length.
-					if(c->buffer_received >= 4)
-					{
-						uint32_t packet_size = *(uint32_t*)&c->buffer[0];
-						c->buffer_to_receive = packet_size + 4;
-
-						// Check the size, it shouldn't exceed MAX_RCON_REQUEST and shouldn't be zero
-						if (packet_size > MAX_RCON_REQUEST || !packet_size)
-						{
-							di_printf(di, "[WARN] Client %zu sent invalid size of request: '%zu' bytes\n",i , c->buffer_to_receive);
-							c->socket_client = -1;
-							close(sock);
-							continue;
-						}
-						if (di->conf_debug) di_printf(di, "[DEBUG] Receiving client request %zu of %zu bytes\n", c->buffer_received - 4, c->buffer_to_receive - 4);
-					}
+					if (!cb_to_recv && cb_recv >= 4) cb_to_recv = packrecv->length + 4;
+					if (di->conf_debug) di_printf(di, "[DEBUG] RCON response received: packet size = %zu, received size = %zu\n", cb_to_recv, cb_recv);
 				}
 			}
 
-			// Send the request to RCON server if not sent
-			if (c->buffer_to_receive && c->buffer_received >= c->buffer_to_receive)
+			// If a complete response had received, redirect it to the specific client
+			if(cb_to_recv && cb_recv >= cb_to_recv)
 			{
-				if (!c->buffer_sent)
+				size_t cb_payload = cb_to_recv - RCON_HEADER_SIZE;
+				if (packrecv->type != 0)
 				{
-					if (rcon_ready_to_send)
-					{
-						size_t send_len;
-						retval = di_send_rcon_packet(di, c->request_id, 2, &c->buffer[4], c->buffer_received - 4, &send_len);
+					di_printf(di, "[FAIL] The RCON server returned a packet with unknown type (%d).\n", packrecv->type);
+					goto OnRconReset;
+				}
 
+				// Redirect the packet to the client which have the same request id
+				for(i = 0; i < di->client_count; i++)
+				{
+					daemon_client_p c = &di->clients[i];
+
+					// Check if activity or not
+					if (c->socket_client == -1) continue;
+
+					// Check the request id
+					if (c->request_id != packrecv->request_id) continue;
+
+					// Check if it had redirected the response it already got
+					if (c->response_received && !c->response_sent) break;
+
+					memcpy(c->response, packrecv->payload, cb_payload);
+					c->response_received = 1;
+					c->response_sent = 0;
+					c->response_size = cb_payload;
+					if (di->conf_debug) di_printf(di, "[DEBUG] RCON response copied to %zu: %s\n", i, c->response);
+					break;
+				}
+
+				// Check if no client matches
+				if (i >= di->client_count)
+				{
+					if (di->conf_log_rcon) di_printf(di, "[RCON] (Not redirected to client) %s\n", packrecv->payload);
+					di_printf(di, "[INFO] The RCON server returned a packet with a request id (%d) which doesn't belongs to current clients.\n", packrecv->request_id);
+				}
+				cb_recv -= cb_to_recv;
+				if (cb_recv)
+				{
+					memmove(response_buf, &response_buf[cb_to_recv], cb_recv);
+					if (cb_recv >= 4)
+					{
+						cb_to_recv = packrecv->length + 4;
+						if (di->conf_debug) di_printf(di, "[DEBUG] Remaining %zu bytes of response with packet size %zu to redirect.\n", cb_recv, cb_to_recv);
+					}
+					else
+					{
+						cb_to_recv = 0;
+						if (di->conf_debug) di_printf(di, "[DEBUG] Remaining %zu bytes of response to redirect.\n", cb_recv);
+					}
+				}
+				else
+				{
+					cb_to_recv = 0;
+				}
+			}
+			
+			if (FD_ISSET(di->socket_to_rcon, &writefds))
+			{
+				rcon_ready_to_send = 1;
+			}
+
+			for(i = 0; i < di->client_count; i++)
+			{
+				daemon_client_p c = &di->clients[i];
+				int sock = c->socket_client;
+				if (sock == -1) continue;
+				if (!c->buffer_to_receive || c->buffer_received < c->buffer_to_receive)
+				{
+					if (FD_ISSET(sock, &readfds))
+					{
+						retval = recv(sock, recv_buf, sizeof recv_buf, 0);
 						// Check if error occurs or the client closes the socket
 						if (retval <= 0)
 						{
 							if (retval < 0)
 							{
-								di_printf(di, "[FAIL] Send request to the RCON server failed: %s.\n", strerror(errno));
+								di_printf(di, "[WARN] Receive requests from client %zu failed: %s.\n", i, strerror(errno));
 							}
 							else
 							{
-								di_printf(di, "[INFO] The RCON server closed the connection.\n");
+								if (di->conf_debug) di_printf(di, "[DEBUG] The client %zu closed the connection.\n", i);
 							}
-							return 1;
+							c->socket_client = -1;
+							close(sock);
+							continue;
 						}
-						c->buffer_sent = 1;
-						if (di->conf_debug) di_printf(di, "[DEBUG] Position %zu, request sent\n", i);
+
+						// Copy the received data to the end of the buffer
+						if (c->buffer_received + retval <= sizeof c->buffer)
+						{
+							memcpy(&c->buffer[c->buffer_received], recv_buf, retval);
+							c->buffer_received += retval;
+						}
+						else
+						{
+							di_printf(di, "[WARN] The client %zu had sent too many data (%zu bytes) that could not fit the buffer (capacity of %zu bytes).\n",
+								i, c->buffer_received + retval, sizeof c->buffer);
+							c->socket_client = -1;
+							close(sock);
+							continue;
+						}
+
+						// The first 4 bytes is the length of client's packet length.
+						if(c->buffer_received >= 4)
+						{
+							uint32_t packet_size = *(uint32_t*)&c->buffer[0];
+							c->buffer_to_receive = packet_size + 4;
+
+							// Check the size, it shouldn't exceed MAX_RCON_REQUEST and shouldn't be zero
+							if (packet_size > MAX_RCON_REQUEST || !packet_size)
+							{
+								di_printf(di, "[WARN] Client %zu sent invalid size of request: '%zu' bytes\n",i , c->buffer_to_receive);
+								c->socket_client = -1;
+								close(sock);
+								continue;
+							}
+							if (di->conf_debug) di_printf(di, "[DEBUG] Receiving client request %zu of %zu bytes\n", c->buffer_received - 4, c->buffer_to_receive - 4);
+						}
 					}
 				}
-				else if (c->response_received)
+
+				// Send the request to RCON server if not sent
+				if (c->buffer_to_receive && c->buffer_received >= c->buffer_to_receive)
 				{
-					if (!c->response_sent)
+					if (!c->buffer_sent)
 					{
-						if (FD_ISSET(sock, &writefds))
+						if (rcon_ready_to_send)
 						{
-							// Send the response back to the client
-							if (di->conf_response_newline && c->response_size < sizeof c->response)
-							{
-								c->response[c->response_size++] = '\n';
-							}
-							retval = send(sock, c->response, c->response_size, 0);
+							size_t send_len;
+							retval = di_send_rcon_packet(di, c->request_id, 2, &c->buffer[4], c->buffer_received - 4, &send_len);
 
 							// Check if error occurs or the client closes the socket
 							if (retval <= 0)
 							{
 								if (retval < 0)
 								{
-									di_printf(di, "[WARN] Sending response back to the client %zu failed: %s.\n", i, strerror(errno));
+									di_printf(di, "[FAIL] Send request to the RCON server failed: %s.\n", strerror(errno));
 								}
-								c->socket_client = -1;
-								close(sock);
-								continue;
+								else
+								{
+									di_printf(di, "[INFO] The RCON server closed the connection.\n");
+								}
+								goto OnRconReset;
 							}
-							if (di->conf_log_rcon) di_printf(di, "[RCON] %s\n", c->response);
-							if (c->response_size >= MAX_RCON_RESPONSE_PAYLOAD)
+							c->buffer_sent = 1;
+							if (di->conf_debug) di_printf(di, "[DEBUG] Position %zu, request sent\n", i);
+						}
+					}
+					else if (c->response_received)
+					{
+						if (!c->response_sent)
+						{
+							if (FD_ISSET(sock, &writefds))
 							{
-								c->response_time = time(NULL);
-								c->response_sent = 1;
-								c->response_received = 0; // Process the fragmentation
-								if (di->conf_debug) di_printf(di, "[DEBUG] Waiting for further response of client %zu.\n", i);
+								// Send the response back to the client
+								if (di->conf_response_newline && c->response_size < sizeof c->response)
+								{
+									c->response[c->response_size++] = '\n';
+								}
+								retval = send(sock, c->response, c->response_size, 0);
+
+								// Check if error occurs or the client closes the socket
+								if (retval <= 0)
+								{
+									if (retval < 0)
+									{
+										di_printf(di, "[WARN] Sending response back to the client %zu failed: %s.\n", i, strerror(errno));
+									}
+									c->socket_client = -1;
+									close(sock);
+									continue;
+								}
+								if (di->conf_log_rcon) di_printf(di, "[RCON] %s\n", c->response);
+								if (c->response_size >= MAX_RCON_RESPONSE_PAYLOAD)
+								{
+									c->response_time = time(NULL);
+									c->response_sent = 1;
+									c->response_received = 0; // Process the fragmentation
+									if (di->conf_debug) di_printf(di, "[DEBUG] Waiting for further response of client %zu.\n", i);
+								}
+								else
+								{
+									c->socket_client = -1;
+									close(sock);
+									if (di->conf_debug) di_printf(di, "[DEBUG] Closed the connection to the client %zu.\n", i);
+									continue;
+								}
 							}
-							else
+						}
+						else
+						{
+							if (c->response_size < MAX_RCON_RESPONSE_PAYLOAD || time(NULL) - c->response_time >= MAX_RCON_RESPONSE_WAIT)
 							{
 								c->socket_client = -1;
 								close(sock);
@@ -936,64 +1006,56 @@ int di_run(daemon_inst_p di)
 							}
 						}
 					}
+				}
+			}
+
+			// Process incoming connections
+			if (FD_ISSET(di->socket_listen, &readfds))
+			{
+				char addr_buf[256];
+				socklen_t addr_len = sizeof addr_buf;
+				for(i = 0; i < di->client_count; i++)
+				{
+					daemon_client_p c = &di->clients[i];
+					int sock = c->socket_client;
+					if (sock != -1) continue;
+					sock = accept(di->socket_listen, (struct sockaddr *)&addr_buf, &addr_len);
+					if (sock == -1)
+					{
+						di_printf(di, "[FAIL] Accept the incoming connection failed: %s.\n", strerror(errno));
+					}
 					else
 					{
-						if (c->response_size < MAX_RCON_RESPONSE_PAYLOAD || time(NULL) - c->response_time >= MAX_RCON_RESPONSE_WAIT)
+						if (di->conf_log_rcon)
 						{
-							c->socket_client = -1;
-							close(sock);
-							if (di->conf_debug) di_printf(di, "[DEBUG] Closed the connection to the client %zu.\n", i);
-							continue;
+							char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+							if (getnameinfo((struct sockaddr *)&addr_buf, addr_len,
+								hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
+								NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+							{
+								di_printf(di, "[INFO] Accepted connection from %s:%s as client %zu.\n", hbuf, sbuf, i);
+							}
+							else
+							{
+								di_printf(di, "[INFO] Accepted connection from unknown client as %zu.\n", i);
+							}
 						}
+
+						memset(&di->clients[i], 0, sizeof di->clients[i]);
+						c->socket_client = sock;
+						c->request_id = di_new_request_id(di);
 					}
+					break;
+				}
+				if (i >= di->client_count)
+				{
+					di_printf(di, "[WARN] No more room for the new connections from the clients.\n");
 				}
 			}
 		}
 
-		// Process incoming connections
-		if (FD_ISSET(di->socket_listen, &readfds))
-		{
-			char addr_buf[256];
-			socklen_t addr_len = sizeof addr_buf;
-			for(i = 0; i < di->client_count; i++)
-			{
-				daemon_client_p c = &di->clients[i];
-				int sock = c->socket_client;
-				if (sock != -1) continue;
-				sock = accept(di->socket_listen, (struct sockaddr *)&addr_buf, &addr_len);
-				if (sock == -1)
-				{
-					di_printf(di, "[FAIL] Accept the incoming connection failed: %s.\n", strerror(errno));
-				}
-				else
-				{
-					if (di->conf_log_rcon)
-					{
-						char hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
-						if (getnameinfo((struct sockaddr *)&addr_buf, addr_len,
-							hbuf, sizeof(hbuf), sbuf, sizeof(sbuf),
-							NI_NUMERICHOST | NI_NUMERICSERV) == 0)
-						{
-							di_printf(di, "[INFO] Accepted connection from %s:%s as client %zu.\n", hbuf, sbuf, i);
-						}
-						else
-						{
-							di_printf(di, "[INFO] Accepted connection from unknown client as %zu.\n", i);
-						}
-					}
-
-					memset(&di->clients[i], 0, sizeof di->clients[i]);
-					c->socket_client = sock;
-					c->request_id = di->cur_request_id ++;
-				}
-				break;
-			}
-			if (i >= di->client_count)
-			{
-				di_printf(di, "[WARN] No more room for the new connections from the clients.\n");
-			}
-		}
-	}
+OnRconReset:;
+	}while(di->daemonized);
 
 	return 1;
 }
@@ -1113,12 +1175,6 @@ void run_as_daemon(char *cfg_filepath, char *log_filepath, int do_daemonize)
 	di->daemonized = do_daemonize;
 
 	if(!di_parse_cfg_file(di, cfg_filepath))
-	{
-		exit_code = 1;
-		goto CleanupExit;
-	}
-
-	if(!di_init(di))
 	{
 		exit_code = 1;
 		goto CleanupExit;
