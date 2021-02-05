@@ -1,24 +1,24 @@
-# Minecraft RCON Daemon
+# The Minecraft RCON Daemon
 
-The daemon is to help for scripting the Minecraft server. It's written by C, to achieve high performance, low costing, and efficient server control.
+The daemon is to help for scripting the Minecraft server. It's written by C, to achieve high performance, low costing, and efficient per-command responsible server control.
 
 ## Usage
 
-First, you need to enable RCON for your Minecraft server by editing `server.properites`, then you need to run the program in daemon mode. As the daemon, it connects the Minecraft server's RCON port, and then it's ready for you to run commands through it's client mode.
+First, you need to enable RCON for your Minecraft server by editing `server.properites` to enable the RCON port of the server. Then you can run the program as a daemon, it connects the Minecraft server's RCON port, and then it's ready for you to run commands through it's client mode.
 
 Typically use a screen for the container to run it as the daemon. For example:
 
     # screen -S MCRCOND ./mcrcond -s
     
-If the screen terminates immediately, you can check the log file for the information.
+If the screen terminates immediately, you can check the log file for the information. For the first run, it will generate a default configuration file as the template. You can edit the configuration file to make it suitable for your server, then restart the daemon.
 
-For first run, it will generate a default configuration file as the template, and then exit. You can verify the configuration file for your case.
-
-When the daemon is ready, you can then use the program as the client to run Minecraft commands. The client mode program sends the command to the daemon, and wait for the response from the server, and output it to `stdout`. For example:
+When the daemon is ready, you can then run the program as the client to send Minecraft commands to the server. The client mode program sends the command to the daemon, and the daemon sends the command to the server. After receiving the responses from the server, the daemon returns them to the client, then the client shows the output through `stdout`. For example:
 
     # ./mcrcond -e list
-    
-If the command needs parameters, use quotation marks:
+
+Then you can see the player lists. The standard output can be redirected to files or pipes.
+
+If the command needs parameters, you have to use the quotation marks:
 
     # ./mcrcond -e "say Hahaha!"
 
@@ -28,7 +28,7 @@ There's no standard way for you to install this software. You need to setup your
 
 ## Notice
 
-Currently, run it as a screen session is recommended because the real daemon mode implementation **isn't stable** . If you can fix this or you think it's needed to run as a real daemon, please modify the code yourself.
+Currently, run it as a screen session is recommended because the real daemon mode implementation **isn't stable** . If you can fix this or you think it's needed to run as a real daemon, please modify the code yourself, then send me a pull request.
 
 If the Minecraft server closes the RCON connection, the daemon mode program exits. **You have to design a loop script** to keep the daemon running. There's mainly 2 reasons that the server will close the connection:
 
